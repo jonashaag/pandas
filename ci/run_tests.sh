@@ -1,4 +1,5 @@
 #!/bin/bash -e
+exit 1
 
 # Workaround for pytest-xdist (it collects different tests in the workers if PYTHONHASHSEED is not set)
 # https://github.com/pytest-dev/pytest/issues/920
