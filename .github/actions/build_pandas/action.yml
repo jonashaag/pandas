@@ -3,15 +3,25 @@ description: Rebuilds the C extensions and installs pandas
 runs:
   using: composite
   steps:
-
     - name: Environment Detail
       run: |
-        conda info
-        conda list
+        if which mamba 2>/dev/null; then
+          mamba info
+          mamba list
+          mamba info | grep -Ei 'environment.+:' | grep -qEiv 'environment.+:.+none'
+        fi
+        pip list
+        python --version
       shell: bash -el {0}
 
     - name: Build Pandas
       run: |
-        python setup.py build_ext -j 2
-        python -m pip install -e . --no-build-isolation --no-use-pep517 --no-index
+        which python
+        which pip
+        time python setup.py build_ext -v -j 3
+        pip install -v -e . --no-build-isolation --no-use-pep517 --no-index
+      shell: bash -el {0}
+
+    - name: Build Version
+      run: pushd /tmp && python -c "import pandas; pandas.show_versions();" && popd
       shell: bash -el {0}
