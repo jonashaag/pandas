@@ -1,130 +1,688 @@
+# cython: language_level=3
 # cython: profile=False
 # cython: boundscheck=False, initializedcheck=False
-from cython cimport Py_ssize_t
+from libc.stdint cimport (
+    uint8_t,
+    uint16_t,
+    uint32_t,
+    uint64_t,
+)
+from libc.stdlib cimport (
+    calloc,
+    free,
+    malloc,
+)
+from libc.string cimport (
+    memcmp,
+    memcpy,
+    memset,
+)
+
 import numpy as np
 
 import pandas.io.sas.sas_constants as const
 
-ctypedef signed long long   int64_t
-ctypedef unsigned char      uint8_t
-ctypedef unsigned short     uint16_t
 
-# rle_decompress decompresses data using a Run Length Encoding
+cdef object _np_nan = np.nan
+# Buffer for decompressing short rows.
+cdef uint8_t *_process_byte_array_with_data_buf = <uint8_t *>malloc(1024 * sizeof(uint8_t))
+
+# Typed const aliases for quick access.
+assert len(const.page_meta_types) == 2
+cdef:
+    int page_meta_types_0 = const.page_meta_types[0]
+    int page_meta_types_1 = const.page_meta_types[1]
+    int page_mix_type = const.page_mix_type
+
+    int subheader_pointers_offset = const.subheader_pointers_offset
+    int truncated_subheader_id = const.truncated_subheader_id
+    int compressed_subheader_id = const.compressed_subheader_id
+    int compressed_subheader_type = const.compressed_subheader_type
+
+    int data_subheader_index = const.SASIndex.data_subheader_index
+    int row_size_index = const.SASIndex.row_size_index
+    int column_size_index = const.SASIndex.column_size_index
+    int column_text_index = const.SASIndex.column_text_index
+    int column_name_index = const.SASIndex.column_name_index
+    int column_attributes_index = const.SASIndex.column_attributes_index
+    int format_and_label_index = const.SASIndex.format_and_label_index
+    int column_list_index = const.SASIndex.column_list_index
+    int subheader_counts_index = const.SASIndex.subheader_counts_index
+
+# Typed const aliases: subheader_signature_to_index.
+# Flatten the const.subheader_signature_to_index dictionary to lists of raw keys and values.
+# Since the dictionary is small it is much faster to have an O(n) loop through the raw keys
+# rather than use a Python dictionary lookup.
+assert all(len(k) in (4, 8) for k in const.subheader_signature_to_index)
+_sigs32 = {k: v for k, v in const.subheader_signature_to_index.items() if len(k) == 4}
+_sigs64 = {k: v for k, v in const.subheader_signature_to_index.items() if len(k) == 8}
+cdef:
+    _subheader_signature_to_index_keys32 = b"".join(_sigs32.keys())
+    const uint32_t *subheader_signature_to_index_keys32 = (
+        <const uint32_t *><const uint8_t *>_subheader_signature_to_index_keys32
+    )
+    Py_ssize_t[:] subheader_signature_to_index_values32 = (
+        np.asarray(list(_sigs32.values()))
+    )
+
+    _subheader_signature_to_index_keys64 = b"".join(_sigs64.keys())
+    const uint64_t *subheader_signature_to_index_keys64 = (
+        <const uint64_t *><const uint8_t *>_subheader_signature_to_index_keys64
+    )
+    Py_ssize_t[:] subheader_signature_to_index_values64 = (
+        np.asarray(list(_sigs64.values()))
+    )
+
+
+cdef class _SubheaderPointer:
+    cdef:
+        Py_ssize_t offset
+        Py_ssize_t length
+
+    def __init__(self, Py_ssize_t offset, Py_ssize_t length):
+        self.offset = offset
+        self.length = length
+
+
+cdef class BasePage:
+    """A page (= bunch of bytes) with with unknown endianness.
+
+    Supports reading raw bytes."""
+    cdef:
+        object sas7bdatreader
+        readonly bytes data
+        const uint8_t *data_raw
+        Py_ssize_t data_len
+
+    def __init__(self, sas7bdatreader, data):
+        self.sas7bdatreader = sas7bdatreader
+        self.data = data
+        self.data_raw = self.data
+        self.data_len = len(data)
+
+    def __len__(self):
+        return self.data_len
+
+    def read_bytes(self, Py_ssize_t offset, Py_ssize_t width):
+        self.check_read(offset, width)
+        return self.data_raw[offset:offset+width]
+
+    cpdef bint check_read(self, Py_ssize_t offset, Py_ssize_t width) except -1:
+        if offset + width > self.data_len:
+            self.sas7bdatreader.close()
+            raise ValueError("The cached page is too small.")
+        return True
+
+
+cdef class Page(BasePage):
+    """A page with known endianness.
+
+    Supports reading raw bytes, integers and floats."""
+    cdef bint file_is_little_endian, need_byteswap
+
+    def __init__(self, sas7bdatreader, data, file_is_little_endian):
+        super().__init__(sas7bdatreader, data)
+        self.file_is_little_endian = file_is_little_endian
+        self.need_byteswap = file_is_little_endian != _machine_is_little_endian()
+
+    def process_page_metadata(self):
+        cdef:
+            Py_ssize_t int_length = self.sas7bdatreader._int_length
+            Py_ssize_t total_offset
+            Py_ssize_t subheader_offset
+            Py_ssize_t subheader_length
+            Py_ssize_t subheader_compression
+            Py_ssize_t subheader_type
+            Py_ssize_t page_bit_offset = self.sas7bdatreader._page_bit_offset
+            Py_ssize_t current_page_subheaders_count = (
+                self.sas7bdatreader._current_page_subheaders_count
+            )
+            Py_ssize_t subheader_pointer_length = (
+                self.sas7bdatreader._subheader_pointer_length
+            )
+            list current_page_data_subheader_pointers = (
+                self.sas7bdatreader._current_page_data_subheader_pointers
+            )
+            Py_ssize_t i
+
+        for i in range(current_page_subheaders_count):
+            total_offset = subheader_pointers_offset + page_bit_offset + subheader_pointer_length * i
+
+            subheader_offset = self.read_int(total_offset, int_length)
+            total_offset += int_length
+
+            subheader_length = self.read_int(total_offset, int_length)
+            total_offset += int_length
+
+            subheader_compression = self.read_int(total_offset, 1)
+            total_offset += 1
+
+            subheader_type = self.read_int(total_offset, 1)
+
+            if subheader_length == 0 or subheader_compression == truncated_subheader_id:
+                continue
+
+            subheader_index = self._get_subheader_index(
+                subheader_offset,
+                int_length,
+                subheader_compression,
+                subheader_type,
+            )
+            processor = self._get_subheader_processor(subheader_index)
+            if processor is None:
+                current_page_data_subheader_pointers.append(
+                    _SubheaderPointer(subheader_offset, subheader_length)
+                )
+            else:
+                processor(subheader_offset, subheader_length)
+
+    cdef int _get_subheader_index(
+        self,
+        Py_ssize_t signature_offset,
+        Py_ssize_t signature_length,
+        Py_ssize_t compression,
+        Py_ssize_t ptype,
+    ) except -1:
+        cdef Py_ssize_t i
+
+        self.check_read(signature_offset, signature_length)
+
+        if signature_length == 4:
+            for i in range(len(subheader_signature_to_index_values32)):
+                if not memcmp(
+                    &subheader_signature_to_index_keys32[i],
+                    &self.data_raw[signature_offset],
+                    4,
+                ):
+                    return subheader_signature_to_index_values32[i]
+        else:
+            for i in range(len(subheader_signature_to_index_values64)):
+                if not memcmp(
+                    &subheader_signature_to_index_keys64[i],
+                    &self.data_raw[signature_offset],
+                    8,
+                ):
+                    return subheader_signature_to_index_values64[i]
+
+        if (
+            self.sas7bdatreader.compression
+            and (compression in (compressed_subheader_id, 0))
+            and ptype == compressed_subheader_type
+        ):
+            return data_subheader_index
+        else:
+            self.sas7bdatreader.close()
+            raise ValueError(
+                f"Unknown subheader signature {self.data_raw[signature_offset:signature_offset+signature_length]}"
+            )
+
+    cdef _get_subheader_processor(self, Py_ssize_t index):
+        if index == data_subheader_index:
+            return None
+        elif index == row_size_index:
+            return self.sas7bdatreader._process_rowsize_subheader
+        elif index == column_size_index:
+            return self.sas7bdatreader._process_columnsize_subheader
+        elif index == column_text_index:
+            return self.sas7bdatreader._process_columntext_subheader
+        elif index == column_name_index:
+            return self.sas7bdatreader._process_columnname_subheader
+        elif index == column_attributes_index:
+            return self.sas7bdatreader._process_columnattributes_subheader
+        elif index == format_and_label_index:
+            return self.sas7bdatreader._process_format_subheader
+        elif index == column_list_index:
+            return self.sas7bdatreader._process_columnlist_subheader
+        elif index == subheader_counts_index:
+            return self.sas7bdatreader._process_subheader_counts
+        else:
+            raise ValueError(f"unknown subheader index {index}")
+
+    cpdef double read_float(self, Py_ssize_t offset, Py_ssize_t width) except? 1337:
+        self.check_read(offset, width)
+        cdef const uint8_t *d = &self.data_raw[offset]
+        if width == 4:
+            return _read_float_with_byteswap(d, self.need_byteswap)
+        else:
+            return _read_double_with_byteswap(d, self.need_byteswap)
+
+    cpdef uint64_t read_int(self, Py_ssize_t offset, Py_ssize_t width) except? 1337:
+        self.check_read(offset, width)
+        cdef const uint8_t *d = &self.data_raw[offset]
+        if width == 1:
+            return d[0]
+        elif width == 2:
+            return _read_uint16_with_byteswap(d, self.need_byteswap)
+        elif width == 4:
+            return _read_uint32_with_byteswap(d, self.need_byteswap)
+        else:
+            return _read_uint64_with_byteswap(d, self.need_byteswap)
+
+
+cdef class SAS7BDATCythonReader:
+    """Fast extensions to SAS7BDATCythonReader."""
+    cdef:
+        # Static
+        object sas7bdatreader
+        uint8_t[:, :] byte_chunk
+        object[:, :] string_chunk
+        int row_length
+        int page_bit_offset
+        int subheader_pointer_length
+        int row_count
+        int mix_page_row_count
+        bint blank_missing
+        bytes encoding
+        # Synced Cython <-> Python, see _update_{c,p}ython_row_indices()
+        public int current_row_in_chunk_index
+        public int current_row_in_file_index
+        # Synced Python -> Cython, see _update_cython_page_info()
+        public int current_row_on_page_index
+        public int current_page_type
+        public int current_page_block_count
+        public list current_page_data_subheader_pointers
+        public int current_page_subheaders_count
+        public Page cached_page
+
+        Py_ssize_t (*decompress)(
+            const uint8_t *inbuff,
+            Py_ssize_t input_length,
+            uint8_t *outbuff,
+            Py_ssize_t row_length,
+        ) except -1
+
+        Py_ssize_t[:] column_data_offsets, column_data_lengths
+        char[:] column_types
+
+    def __init__(
+        self,
+        sas7bdatreader,
+        byte_chunk,
+        string_chunk,
+        row_length,
+        page_bit_offset,
+        subheader_pointer_length,
+        row_count,
+        mix_page_row_count,
+        blank_missing,
+        encoding,
+        column_data_offsets,
+        column_data_lengths,
+        column_types,
+        compression,
+     ):
+        self.sas7bdatreader = sas7bdatreader
+        self.byte_chunk = byte_chunk
+        self.string_chunk = string_chunk
+        self.row_length = row_length
+        self.page_bit_offset = page_bit_offset
+        self.subheader_pointer_length = subheader_pointer_length
+        self.row_count = row_count
+        self.mix_page_row_count = mix_page_row_count
+        self.blank_missing = blank_missing
+        self.encoding = None if encoding is None else encoding.encode("ascii")
+        self.column_data_offsets = column_data_offsets
+        self.column_data_lengths = column_data_lengths
+        self.column_types = column_types
+
+        # Compression
+        if compression == const.rle_compression:
+            self.decompress = _rle_decompress
+        elif compression == const.rdc_compression:
+            self.decompress = _rdc_decompress
+        else:
+            self.decompress = NULL
+
+    def read(self, Py_ssize_t nrows):
+        cdef bint done
+
+        for _ in range(nrows):
+            done = self._readline()
+            if done:
+                break
+
+    cdef bint _readline(self) except -1:
+        # Loop until a data row is read
+        while self.current_page_type in (
+            page_meta_types_0,
+            page_meta_types_1,
+        ) and self.current_row_on_page_index >= len(
+            self.current_page_data_subheader_pointers
+        ):
+            if self.sas7bdatreader._read_next_page():
+                return True
+
+        if self.current_page_type in (page_meta_types_0, page_meta_types_1):
+            return self._readline_meta_page()
+        elif self.current_page_type == page_mix_type:
+            return self._readline_mix_page()
+        else:
+            return self._readline_data_page()
+
+    cdef bint _readline_meta_page(self) except -1:
+        cdef _SubheaderPointer current_subheader_pointer = (
+            self.current_page_data_subheader_pointers[self.current_row_on_page_index]
+        )
+        self.process_byte_array_with_data(
+            current_subheader_pointer.offset, current_subheader_pointer.length
+        )
+        return False
+
+    cdef bint _readline_mix_page(self) except -1:
+        cdef Py_ssize_t align_correction, offset
+        align_correction = (
+            self.page_bit_offset
+            + subheader_pointers_offset
+            + self.current_page_subheaders_count * self.subheader_pointer_length
+        )
+        align_correction = align_correction % 8
+        offset = self.page_bit_offset + align_correction
+        offset += subheader_pointers_offset
+        offset += self.current_page_subheaders_count * self.subheader_pointer_length
+        offset += self.current_row_on_page_index * self.row_length
+        self.process_byte_array_with_data(offset, self.row_length)
+        if self.current_row_on_page_index == min(self.row_count, self.mix_page_row_count):
+            return self.sas7bdatreader._read_next_page()
+        else:
+            return False
+
+    cdef bint _readline_data_page(self) except -1:
+        self.process_byte_array_with_data(
+            self.page_bit_offset
+            + subheader_pointers_offset
+            + self.current_row_on_page_index * self.row_length,
+            self.row_length,
+        )
+        if self.current_row_on_page_index == self.current_page_block_count:
+            return self.sas7bdatreader._read_next_page()
+        else:
+            return False
+
+    cpdef bint process_byte_array_with_data(self, int offset, int length) except -1:
+        cdef:
+            char column_type
+            Py_ssize_t data_length, data_offset
+            const uint8_t *source
+            Py_ssize_t j, rpos, m, jb = 0, js = 0
+            uint8_t *decompress_dynamic_buf = NULL
+            object tmp
+
+        assert offset + length <= self.cached_page.data_len
+        source = &self.cached_page.data_raw[offset]
+        if self.decompress != NULL and length < self.row_length:
+            if self.row_length <= 1024:
+                memset(_process_byte_array_with_data_buf, 0, self.row_length)
+                rpos = self.decompress(
+                    source, length, _process_byte_array_with_data_buf, self.row_length
+                )
+                source = _process_byte_array_with_data_buf
+            else:
+                decompress_dynamic_buf = <uint8_t *>calloc(self.row_length, sizeof(uint8_t))
+                if decompress_dynamic_buf == NULL:
+                    nbytes = self.row_length * sizeof(uint8_t)
+                    raise MemoryError(f"Failed to allocate {nbytes} bytes")
+                rpos = self.decompress(source, length, decompress_dynamic_buf, self.row_length)
+                source = decompress_dynamic_buf
+            if rpos != self.row_length:
+                raise ValueError(
+                    f"Expected decompressed line of length {self.row_length} bytes but decompressed {rpos} bytes"
+                )
+
+        for j in range(len(self.column_data_offsets)):
+            column_type = self.column_types[j]
+            data_length = self.column_data_lengths[j]
+            data_offset = self.column_data_offsets[j]
+            if data_length == 0:
+                break
+            assert data_offset + data_length <= self.row_length
+            if column_type == b"d":
+                # decimal
+                # TODO optimize this, can only be 8 or 4
+                m = 8 * self.current_row_in_chunk_index
+                if self.cached_page.file_is_little_endian:
+                    m += 8 - data_length
+                memcpy(&self.byte_chunk[jb, m], &source[data_offset], data_length)
+                jb += 1
+            elif column_type == b"s":
+                # string
+                # Quickly skip 8-byte blocks of trailing whitespace.
+                while (
+                    data_length > 8
+                    and source[data_offset+data_length-8] in b"\x00 "
+                    and source[data_offset+data_length-7] in b"\x00 "
+                    and source[data_offset+data_length-6] in b"\x00 "
+                    and source[data_offset+data_length-5] in b"\x00 "
+                    and source[data_offset+data_length-4] in b"\x00 "
+                    and source[data_offset+data_length-3] in b"\x00 "
+                    and source[data_offset+data_length-2] in b"\x00 "
+                    and source[data_offset+data_length-1] in b"\x00 "
+                ):
+                    data_length -= 8
+                # Skip the rest of the trailing whitespace.
+                while data_length > 0 and source[data_offset+data_length-1] in b"\x00 ":
+                    data_length -= 1
+                if self.blank_missing and not data_length:
+                    self.string_chunk[js, self.current_row_in_chunk_index] = _np_nan
+                else:
+                    self.string_chunk[js, self.current_row_in_chunk_index] = (
+                        source[data_offset:data_offset+data_length]
+                        if self.encoding is None else
+                        source[data_offset:data_offset+data_length].decode(self.encoding)
+                    )
+                js += 1
+            else:
+                raise ValueError(f"unknown column type {column_type!r}")
+
+        self.current_row_in_chunk_index += 1
+        self.current_row_in_file_index += 1
+        self.current_row_on_page_index += 1
+
+        if decompress_dynamic_buf != NULL:
+            free(decompress_dynamic_buf)
+
+        return True
+
+
+cdef inline float _read_float_with_byteswap(const uint8_t *data, bint byteswap):
+    cdef float res = (<float*>data)[0]
+    if byteswap:
+        res = _byteswap_float(res)
+    return res
+
+
+cdef inline double _read_double_with_byteswap(const uint8_t *data, bint byteswap):
+    cdef double res = (<double*>data)[0]
+    if byteswap:
+        res = _byteswap_double(res)
+    return res
+
+
+cdef inline uint16_t _read_uint16_with_byteswap(const uint8_t *data, bint byteswap):
+    cdef uint16_t res = (<uint16_t *>data)[0]
+    if byteswap:
+        res = _byteswap2(res)
+    return res
+
+
+cdef inline uint32_t _read_uint32_with_byteswap(const uint8_t *data, bint byteswap):
+    cdef uint32_t res = (<uint32_t *>data)[0]
+    if byteswap:
+        res = _byteswap4(res)
+    return res
+
+
+cdef inline uint64_t _read_uint64_with_byteswap(const uint8_t *data, bint byteswap):
+    cdef uint64_t res = (<uint64_t *>data)[0]
+    if byteswap:
+        res = _byteswap8(res)
+    return res
+
+
+# Byteswapping
+# From https://github.com/WizardMac/ReadStat/blob/master/src/readstat_bits.
+# Copyright (c) 2013-2016 Evan Miller, Apache 2 License
+
+cdef inline bint _machine_is_little_endian():
+    cdef int test_byte_order = 1;
+    return (<char*>&test_byte_order)[0]
+
+
+cdef inline uint16_t _byteswap2(uint16_t num):
+    return ((num & 0xFF00) >> 8) | ((num & 0x00FF) << 8)
+
+
+cdef inline uint32_t _byteswap4(uint32_t num):
+    num = ((num & <uint32_t>0xFFFF0000) >> 16) | ((num & <uint32_t>0x0000FFFF) << 16)
+    return ((num & <uint32_t>0xFF00FF00) >> 8) | ((num & <uint32_t>0x00FF00FF) << 8)
+
+
+cdef inline uint64_t _byteswap8(uint64_t num):
+    num = ((num & <uint64_t>0xFFFFFFFF00000000) >> 32) | ((num & <uint64_t>0x00000000FFFFFFFF) << 32)
+    num = ((num & <uint64_t>0xFFFF0000FFFF0000) >> 16) | ((num & <uint64_t>0x0000FFFF0000FFFF) << 16)
+    return ((num & <uint64_t>0xFF00FF00FF00FF00) >> 8) | ((num & <uint64_t>0x00FF00FF00FF00FF) << 8)
+
+
+cdef inline float _byteswap_float(float num):
+    cdef uint32_t answer = 0
+    memcpy(&answer, &num, 4)
+    answer = _byteswap4(answer)
+    memcpy(&num, &answer, 4)
+    return num
+
+
+cdef inline double _byteswap_double(double num):
+    cdef uint64_t answer = 0
+    memcpy(&answer, &num, 8)
+    answer = _byteswap8(answer)
+    memcpy(&num, &answer, 8)
+    return num
+
+
+# Decompression
+
+# _rle_decompress decompresses data using a Run Length Encoding
 # algorithm.  It is partially documented here:
 #
 # https://cran.r-project.org/package=sas7bdat/vignettes/sas7bdat.pdf
-cdef const uint8_t[:] rle_decompress(int result_length, const uint8_t[:] inbuff) except *:
-
+cdef Py_ssize_t _rle_decompress(
+    const uint8_t *inbuff,
+    Py_ssize_t input_length,
+    uint8_t *outbuff,
+    Py_ssize_t row_length,
+) except -1:
     cdef:
-        uint8_t control_byte, x
-        uint8_t[:] result = np.zeros(result_length, np.uint8)
-        int rpos = 0
-        int i, nbytes, end_of_first_byte
-        Py_ssize_t ipos = 0, length = len(inbuff)
+        Py_ssize_t rpos = 0, ipos = 0, nbytes, control_byte, end_of_first_byte
 
-    while ipos < length:
+    while ipos < input_length:
+        if rpos >= row_length:
+            raise ValueError(f"Invalid RLE out of bounds write at position {rpos} of {row_length}")
+
         control_byte = inbuff[ipos] & 0xF0
-        end_of_first_byte = <int>(inbuff[ipos] & 0x0F)
+        end_of_first_byte = inbuff[ipos] & 0x0F
         ipos += 1
+        if control_byte not in (0xD0, 0xE0, 0xF0):
+            if ipos >= input_length:
+                raise ValueError(f"Invalid RLE out of bounds read at position {ipos} of {input_length}")
 
         if control_byte == 0x00:
-            nbytes = <int>(inbuff[ipos]) + 64 + end_of_first_byte * 256
+            nbytes = <Py_ssize_t>inbuff[ipos] + 64 + end_of_first_byte * 256
             ipos += 1
-            for _ in range(nbytes):
-                result[rpos] = inbuff[ipos]
-                rpos += 1
-                ipos += 1
+            assert rpos + nbytes <= row_length
+            assert ipos + nbytes <= input_length
+            memcpy(&outbuff[rpos], &inbuff[ipos], nbytes)
+            ipos += nbytes
+            rpos += nbytes
         elif control_byte == 0x40:
             # not documented
-            nbytes = (inbuff[ipos] & 0xFF) + 18 + end_of_first_byte * 256
+            nbytes = <Py_ssize_t>inbuff[ipos] + 18 + end_of_first_byte * 256
             ipos += 1
-            for _ in range(nbytes):
-                result[rpos] = inbuff[ipos]
-                rpos += 1
+            assert rpos + nbytes <= row_length
+            memset(&outbuff[rpos], inbuff[ipos], nbytes)
+            rpos += nbytes
             ipos += 1
         elif control_byte == 0x60:
-            nbytes = end_of_first_byte * 256 + <int>(inbuff[ipos]) + 17
+            nbytes = <Py_ssize_t>inbuff[ipos] + 17 + end_of_first_byte * 256
             ipos += 1
-            for _ in range(nbytes):
-                result[rpos] = 0x20
-                rpos += 1
+            assert rpos + nbytes <= row_length
+            memset(&outbuff[rpos], 0x20, nbytes)
+            rpos += nbytes
         elif control_byte == 0x70:
-            nbytes = end_of_first_byte * 256 + <int>(inbuff[ipos]) + 17
+            nbytes = <Py_ssize_t>inbuff[ipos] + 17 + end_of_first_byte * 256
             ipos += 1
-            for _ in range(nbytes):
-                result[rpos] = 0x00
-                rpos += 1
+            assert rpos + nbytes <= row_length
+            memset(&outbuff[rpos], 0x00, nbytes)
+            rpos += nbytes
         elif control_byte == 0x80:
             nbytes = end_of_first_byte + 1
-            for i in range(nbytes):
-                result[rpos] = inbuff[ipos + i]
-                rpos += 1
+            assert rpos + nbytes <= row_length
+            assert ipos + nbytes <= input_length
+            memcpy(&outbuff[rpos], &inbuff[ipos], nbytes)
+            rpos += nbytes
             ipos += nbytes
         elif control_byte == 0x90:
             nbytes = end_of_first_byte + 17
-            for i in range(nbytes):
-                result[rpos] = inbuff[ipos + i]
-                rpos += 1
+            assert rpos + nbytes <= row_length
+            assert ipos + nbytes <= input_length
+            memcpy(&outbuff[rpos], &inbuff[ipos], nbytes)
+            rpos += nbytes
             ipos += nbytes
         elif control_byte == 0xA0:
             nbytes = end_of_first_byte + 33
-            for i in range(nbytes):
-                result[rpos] = inbuff[ipos + i]
-                rpos += 1
+            assert rpos + nbytes <= row_length
+            assert ipos + nbytes <= input_length
+            memcpy(&outbuff[rpos], &inbuff[ipos], nbytes)
+            rpos += nbytes
             ipos += nbytes
         elif control_byte == 0xB0:
             nbytes = end_of_first_byte + 49
-            for i in range(nbytes):
-                result[rpos] = inbuff[ipos + i]
-                rpos += 1
+            assert rpos + nbytes <= row_length
+            assert ipos + nbytes <= input_length
+            memcpy(&outbuff[rpos], &inbuff[ipos], nbytes)
+            rpos += nbytes
             ipos += nbytes
         elif control_byte == 0xC0:
             nbytes = end_of_first_byte + 3
-            x = inbuff[ipos]
+            assert rpos + nbytes <= row_length
+            memset(&outbuff[rpos], inbuff[ipos], nbytes)
             ipos += 1
-            for _ in range(nbytes):
-                result[rpos] = x
-                rpos += 1
+            rpos += nbytes
         elif control_byte == 0xD0:
             nbytes = end_of_first_byte + 2
-            for _ in range(nbytes):
-                result[rpos] = 0x40
-                rpos += 1
+            assert rpos + nbytes <= row_length
+            memset(&outbuff[rpos], 0x40, nbytes)
+            rpos += nbytes
         elif control_byte == 0xE0:
             nbytes = end_of_first_byte + 2
-            for _ in range(nbytes):
-                result[rpos] = 0x20
-                rpos += 1
+            assert rpos + nbytes <= row_length
+            memset(&outbuff[rpos], 0x20, nbytes)
+            rpos += nbytes
         elif control_byte == 0xF0:
             nbytes = end_of_first_byte + 2
-            for _ in range(nbytes):
-                result[rpos] = 0x00
-                rpos += 1
+            assert rpos + nbytes <= row_length
+            memset(&outbuff[rpos], 0x00, nbytes)
+            rpos += nbytes
         else:
             raise ValueError(f"unknown control byte: {control_byte}")
 
-    # In py37 cython/clang sees `len(outbuff)` as size_t and not Py_ssize_t
-    if <Py_ssize_t>len(result) != <Py_ssize_t>result_length:
-        raise ValueError(f"RLE: {len(result)} != {result_length}")
+    return rpos
 
-    return np.asarray(result)
-
-
-# rdc_decompress decompresses data using the Ross Data Compression algorithm:
+# _rdc_decompress decompresses data using the Ross Data Compression algorithm:
 #
 # http://collaboration.cmc.ec.gc.ca/science/rpn/biblio/ddj/Website/articles/CUJ/1992/9210/ross/ross.htm
-cdef const uint8_t[:] rdc_decompress(int result_length, const uint8_t[:] inbuff) except *:
-
+cdef Py_ssize_t _rdc_decompress(
+    const uint8_t *inbuff,
+    Py_ssize_t input_length,
+    uint8_t *outbuff,
+    Py_ssize_t row_length,
+) except -1:
     cdef:
         uint8_t cmd
         uint16_t ctrl_bits = 0, ctrl_mask = 0, ofs, cnt
-        int rpos = 0, k
-        uint8_t[:] outbuff = np.zeros(result_length, dtype=np.uint8)
-        Py_ssize_t ipos = 0, length = len(inbuff)
+        Py_ssize_t rpos = 0, ipos = 0, ii = -1
 
-    ii = -1
-
-    while ipos < length:
+    while ipos < input_length:
+        if rpos >= row_length:
+            raise ValueError(f"Invalid RDC out of bounds write at position {rpos} of {row_length}")
         ii += 1
         ctrl_mask = ctrl_mask >> 1
         if ctrl_mask == 0:
@@ -146,8 +704,7 @@ cdef const uint8_t[:] rdc_decompress(int result_length, const uint8_t[:] inbuff)
         # short RLE
         if cmd == 0:
             cnt += 3
-            for k in range(cnt):
-                outbuff[rpos + k] = inbuff[ipos]
+            memset(&outbuff[rpos], inbuff[ipos], cnt)
             rpos += cnt
             ipos += 1
 
@@ -156,8 +713,7 @@ cdef const uint8_t[:] rdc_decompress(int result_length, const uint8_t[:] inbuff)
             cnt += <uint16_t>inbuff[ipos] << 4
             cnt += 19
             ipos += 1
-            for k in range(cnt):
-                outbuff[rpos + k] = inbuff[ipos]
+            memset(&outbuff[rpos], inbuff[ipos], cnt)
             rpos += cnt
             ipos += 1
 
@@ -169,8 +725,7 @@ cdef const uint8_t[:] rdc_decompress(int result_length, const uint8_t[:] inbuff)
             cnt = <uint16_t>inbuff[ipos]
             ipos += 1
             cnt += 16
-            for k in range(cnt):
-                outbuff[rpos + k] = outbuff[rpos - <int>ofs + k]
+            memcpy(&outbuff[rpos], &outbuff[rpos - ofs], cnt)
             rpos += cnt
 
         # short pattern
@@ -178,259 +733,7 @@ cdef const uint8_t[:] rdc_decompress(int result_length, const uint8_t[:] inbuff)
             ofs = cnt + 3
             ofs += <uint16_t>inbuff[ipos] << 4
             ipos += 1
-            for k in range(cmd):
-                outbuff[rpos + k] = outbuff[rpos - <int>ofs + k]
+            memcpy(&outbuff[rpos], &outbuff[rpos - ofs], cmd)
             rpos += cmd
 
-    # In py37 cython/clang sees `len(outbuff)` as size_t and not Py_ssize_t
-    if <Py_ssize_t>len(outbuff) != <Py_ssize_t>result_length:
-        raise ValueError(f"RDC: {len(outbuff)} != {result_length}\n")
-
-    return np.asarray(outbuff)
-
-
-cdef enum ColumnTypes:
-    column_type_decimal = 1
-    column_type_string = 2
-
-
-# type the page_data types
-assert len(const.page_meta_types) == 2
-cdef:
-    int page_meta_types_0 = const.page_meta_types[0]
-    int page_meta_types_1 = const.page_meta_types[1]
-    int page_mix_type = const.page_mix_type
-    int page_data_type = const.page_data_type
-    int subheader_pointers_offset = const.subheader_pointers_offset
-
-
-cdef class Parser:
-
-    cdef:
-        int column_count
-        int64_t[:] lengths
-        int64_t[:] offsets
-        int64_t[:] column_types
-        uint8_t[:, :] byte_chunk
-        object[:, :] string_chunk
-        char *cached_page
-        int current_row_on_page_index
-        int current_page_block_count
-        int current_page_data_subheader_pointers_len
-        int current_page_subheaders_count
-        int current_row_in_chunk_index
-        int current_row_in_file_index
-        int header_length
-        int row_length
-        int bit_offset
-        int subheader_pointer_length
-        int current_page_type
-        bint is_little_endian
-        const uint8_t[:] (*decompress)(int result_length, const uint8_t[:] inbuff) except *
-        object parser
-
-    def __init__(self, object parser):
-        cdef:
-            int j
-            char[:] column_types
-
-        self.parser = parser
-        self.header_length = self.parser.header_length
-        self.column_count = parser.column_count
-        self.lengths = parser.column_data_lengths()
-        self.offsets = parser.column_data_offsets()
-        self.byte_chunk = parser._byte_chunk
-        self.string_chunk = parser._string_chunk
-        self.row_length = parser.row_length
-        self.bit_offset = self.parser._page_bit_offset
-        self.subheader_pointer_length = self.parser._subheader_pointer_length
-        self.is_little_endian = parser.byte_order == "<"
-        self.column_types = np.empty(self.column_count, dtype='int64')
-
-        # page indicators
-        self.update_next_page()
-
-        column_types = parser.column_types()
-
-        # map column types
-        for j in range(self.column_count):
-            if column_types[j] == b'd':
-                self.column_types[j] = column_type_decimal
-            elif column_types[j] == b's':
-                self.column_types[j] = column_type_string
-            else:
-                raise ValueError(f"unknown column type: {self.parser.columns[j].ctype}")
-
-        # compression
-        if parser.compression == const.rle_compression:
-            self.decompress = rle_decompress
-        elif parser.compression == const.rdc_compression:
-            self.decompress = rdc_decompress
-        else:
-            self.decompress = NULL
-
-        # update to current state of the parser
-        self.current_row_in_chunk_index = parser._current_row_in_chunk_index
-        self.current_row_in_file_index = parser._current_row_in_file_index
-        self.current_row_on_page_index = parser._current_row_on_page_index
-
-    def read(self, int nrows):
-        cdef:
-            bint done
-            int i
-
-        for _ in range(nrows):
-            done = self.readline()
-            if done:
-                break
-
-        # update the parser
-        self.parser._current_row_on_page_index = self.current_row_on_page_index
-        self.parser._current_row_in_chunk_index = self.current_row_in_chunk_index
-        self.parser._current_row_in_file_index = self.current_row_in_file_index
-
-    cdef bint read_next_page(self) except? True:
-        cdef bint done
-
-        done = self.parser._read_next_page()
-        if done:
-            self.cached_page = NULL
-        else:
-            self.update_next_page()
-        return done
-
-    cdef update_next_page(self):
-        # update data for the current page
-
-        self.cached_page = <char *>self.parser._cached_page
-        self.current_row_on_page_index = 0
-        self.current_page_type = self.parser._current_page_type
-        self.current_page_block_count = self.parser._current_page_block_count
-        self.current_page_data_subheader_pointers_len = len(
-            self.parser._current_page_data_subheader_pointers
-        )
-        self.current_page_subheaders_count = self.parser._current_page_subheaders_count
-
-    cdef bint readline(self) except? True:
-
-        cdef:
-            int offset, bit_offset, align_correction
-            int subheader_pointer_length, mn
-            bint done, flag
-
-        bit_offset = self.bit_offset
-        subheader_pointer_length = self.subheader_pointer_length
-
-        # If there is no page, go to the end of the header and read a page.
-        if self.cached_page == NULL:
-            self.parser._path_or_buf.seek(self.header_length)
-            done = self.read_next_page()
-            if done:
-                return True
-
-        # Loop until a data row is read
-        while True:
-            if self.current_page_type in (page_meta_types_0, page_meta_types_1):
-                flag = self.current_row_on_page_index >=\
-                    self.current_page_data_subheader_pointers_len
-                if flag:
-                    done = self.read_next_page()
-                    if done:
-                        return True
-                    continue
-                current_subheader_pointer = (
-                    self.parser._current_page_data_subheader_pointers[
-                        self.current_row_on_page_index])
-                self.process_byte_array_with_data(
-                    current_subheader_pointer.offset,
-                    current_subheader_pointer.length)
-                return False
-            elif self.current_page_type == page_mix_type:
-                align_correction = (
-                    bit_offset
-                    + subheader_pointers_offset
-                    + self.current_page_subheaders_count * subheader_pointer_length
-                )
-                align_correction = align_correction % 8
-                offset = bit_offset + align_correction
-                offset += subheader_pointers_offset
-                offset += self.current_page_subheaders_count * subheader_pointer_length
-                offset += self.current_row_on_page_index * self.row_length
-                self.process_byte_array_with_data(offset, self.row_length)
-                mn = min(self.parser.row_count, self.parser._mix_page_row_count)
-                if self.current_row_on_page_index == mn:
-                    done = self.read_next_page()
-                    if done:
-                        return True
-                return False
-            elif self.current_page_type == page_data_type:
-                self.process_byte_array_with_data(
-                    bit_offset
-                    + subheader_pointers_offset
-                    + self.current_row_on_page_index * self.row_length,
-                    self.row_length,
-                )
-                flag = self.current_row_on_page_index == self.current_page_block_count
-                if flag:
-                    done = self.read_next_page()
-                    if done:
-                        return True
-                return False
-            else:
-                raise ValueError(f"unknown page type: {self.current_page_type}")
-
-    cdef void process_byte_array_with_data(self, int offset, int length) except *:
-
-        cdef:
-            Py_ssize_t j
-            int s, k, m, jb, js, current_row
-            int64_t lngt, start, ct
-            const uint8_t[:] source
-            int64_t[:] column_types
-            int64_t[:] lengths
-            int64_t[:] offsets
-            uint8_t[:, :] byte_chunk
-            object[:, :] string_chunk
-
-        source = np.frombuffer(
-            self.cached_page[offset:offset + length], dtype=np.uint8)
-
-        if self.decompress != NULL and (length < self.row_length):
-            source = self.decompress(self.row_length, source)
-
-        current_row = self.current_row_in_chunk_index
-        column_types = self.column_types
-        lengths = self.lengths
-        offsets = self.offsets
-        byte_chunk = self.byte_chunk
-        string_chunk = self.string_chunk
-        s = 8 * self.current_row_in_chunk_index
-        js = 0
-        jb = 0
-        for j in range(self.column_count):
-            lngt = lengths[j]
-            if lngt == 0:
-                break
-            start = offsets[j]
-            ct = column_types[j]
-            if ct == column_type_decimal:
-                # decimal
-                if self.is_little_endian:
-                    m = s + 8 - lngt
-                else:
-                    m = s
-                for k in range(lngt):
-                    byte_chunk[jb, m + k] = source[start + k]
-                jb += 1
-            elif column_types[j] == column_type_string:
-                # string
-                # Skip trailing whitespace. This is equivalent to calling
-                # .rstrip(b"\x00 ") but without Python call overhead.
-                while lngt > 0 and source[start+lngt-1] in b"\x00 ":
-                    lngt -= 1
-                string_chunk[js, current_row] = (&source[start])[:lngt]
-                js += 1
-
-        self.current_row_on_page_index += 1
-        self.current_row_in_chunk_index += 1
-        self.current_row_in_file_index += 1
+    return rpos

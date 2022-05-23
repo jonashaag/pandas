@@ -1,13 +1,19 @@
 from io import BytesIO
 
 import numpy as np
-from odf.opendocument import OpenDocumentSpreadsheet
-from odf.table import (
-    Table,
-    TableCell,
-    TableRow,
-)
-from odf.text import P
+
+try:
+    from odf.opendocument import OpenDocumentSpreadsheet
+    from odf.table import (
+        Table,
+        TableCell,
+        TableRow,
+    )
+    from odf.text import P
+
+    have_odf = True
+except ModuleNotFoundError:
+    have_odf = False
 
 from pandas import (
     DataFrame,
