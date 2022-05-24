@@ -172,9 +172,9 @@ class SAS7BDATReader(ReaderBase, abc.Iterator):
 
         self.default_encoding = "latin-1"
         self.compression = b""
-        self.column_names_strings: list[str] = []
-        self.column_names: list[str] = []
-        self.column_formats: list[str] = []
+        self.column_names_raw: list[bytes] = []
+        self.column_names: list[str | bytes] = []
+        self.column_formats: list[str | bytes] = []
         self.columns: list[_Column] = []
 
         self._current_page_data_subheader_pointers: list[_SubheaderPointer] = []
@@ -472,12 +472,9 @@ class SAS7BDATReader(ReaderBase, abc.Iterator):
 
         buf = self._cached_page.read_bytes(offset, text_block_size)
         cname_raw = buf[0:text_block_size].rstrip(b"\x00 ")
-        cname = cname_raw
-        if self.convert_header_text:
-            cname = cname.decode(self.encoding or self.default_encoding)
-        self.column_names_strings.append(cname)
+        self.column_names_raw.append(cname_raw)
 
-        if len(self.column_names_strings) == 1:
+        if len(self.column_names_raw) == 1:
             compression_literal = b""
             for cl in const.compression_literals:
                 if cl in cname_raw:
@@ -548,8 +545,14 @@ class SAS7BDATReader(ReaderBase, abc.Iterator):
                 col_name_length, const.column_name_length_length
             )
 
-            name_str = self.column_names_strings[idx]
-            self.column_names.append(name_str[col_offset : col_offset + col_len])
+            name_raw = self.column_names_raw[idx]
+            cname = name_raw[col_offset : col_offset + col_len]
+            if self.convert_header_text:
+                self.column_names.append(
+                    cname.decode(self.encoding or self.default_encoding)
+                )
+            else:
+                self.column_names.append(cname)
 
     def _process_columnattributes_subheader(self, offset: int, length: int) -> None:
         int_len = self._int_length
@@ -599,7 +602,7 @@ class SAS7BDATReader(ReaderBase, abc.Iterator):
         x = self._cached_page.read_int(
             text_subheader_format, const.column_format_text_subheader_index_length
         )
-        format_idx = min(x, len(self.column_names_strings) - 1)
+        format_idx = min(x, len(self.column_names_raw) - 1)
 
         format_start = self._cached_page.read_int(
             col_format_offset, const.column_format_offset_length
@@ -611,7 +614,7 @@ class SAS7BDATReader(ReaderBase, abc.Iterator):
         label_idx = self._cached_page.read_int(
             text_subheader_label, const.column_label_text_subheader_index_length
         )
-        label_idx = min(label_idx, len(self.column_names_strings) - 1)
+        label_idx = min(label_idx, len(self.column_names_raw) - 1)
 
         label_start = self._cached_page.read_int(
             col_label_offset, const.column_label_offset_length
@@ -620,10 +623,24 @@ class SAS7BDATReader(ReaderBase, abc.Iterator):
             col_label_len, const.column_label_length_length
         )
 
-        label_names = self.column_names_strings[label_idx]
-        column_label = label_names[label_start : label_start + label_len]
-        format_names = self.column_names_strings[format_idx]
-        column_format = format_names[format_start : format_start + format_len]
+        label_names = self.column_names_raw[label_idx]
+        column_label_bytes = label_names[label_start : label_start + label_len]
+        column_label: str | bytes
+        if self.convert_header_text:
+            column_label = column_label_bytes.decode(
+                self.encoding or self.default_encoding
+            )
+        else:
+            column_label = column_label_bytes
+        format_names = self.column_names_raw[format_idx]
+        column_format_bytes = format_names[format_start : format_start + format_len]
+        column_format: str | bytes
+        if self.convert_header_text:
+            column_format = column_format_bytes.decode(
+                self.encoding or self.default_encoding
+            )
+        else:
+            column_format = column_format_bytes
         current_column_number = len(self.columns)
 
         col = _Column(
