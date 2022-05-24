@@ -28,11 +28,9 @@ cdef object _np_nan = np.nan
 cdef uint8_t *_process_byte_array_with_data_buf = <uint8_t *>malloc(1024 * sizeof(uint8_t))
 
 # Typed const aliases for quick access.
-assert len(const.page_mix_types) == 2
 cdef:
     int page_meta_type = const.page_meta_type
-    int page_mix_types_0 = const.page_mix_types[0]
-    int page_mix_types_1 = const.page_mix_types[1]
+    int page_mix_type = const.page_mix_type
 
     int subheader_pointers_offset = const.subheader_pointers_offset
     int truncated_subheader_id = const.truncated_subheader_id
@@ -309,7 +307,7 @@ cdef class SAS7BDATCythonReader:
 
         if self.current_page_type == page_meta_type:
             return self._readline_meta_page()
-        elif self.current_page_type in (page_mix_types_0, page_mix_types_1):
+        elif self.current_page_type == page_mix_type:
             return self._readline_mix_page()
         else:
             return self._readline_data_page()
