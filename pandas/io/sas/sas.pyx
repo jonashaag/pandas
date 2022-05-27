@@ -522,9 +522,7 @@ cdef Py_ssize_t _rle_decompress(const uint8_t *inbuff, Py_ssize_t input_length, 
         ipos += 1
 
         if control_byte == 0x00:
-            if end_of_first_byte != 0:
-                raise ValueError("Unexpected non-zero end_of_first_byte")
-            nbytes = <Py_ssize_t>inbuff[ipos] + 64
+            nbytes = <Py_ssize_t>inbuff[ipos] + 64 + end_of_first_byte * 256
             ipos += 1
             memcpy(&outbuff[rpos], &inbuff[ipos], nbytes)
             ipos += nbytes
