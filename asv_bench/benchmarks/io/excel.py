@@ -1,13 +1,19 @@
 from io import BytesIO
 
 import numpy as np
-from odf.opendocument import OpenDocumentSpreadsheet
-from odf.table import (
-    Table,
-    TableCell,
-    TableRow,
-)
-from odf.text import P
+
+try:
+    from odf.opendocument import OpenDocumentSpreadsheet
+    from odf.table import (
+        Table,
+        TableCell,
+        TableRow,
+    )
+    from odf.text import P
+
+    have_odf = True
+except ModuleNotFoundError:
+    have_odf = False
 
 from pandas import (
     DataFrame,
@@ -44,6 +50,25 @@ class WriteExcel:
         bio.seek(0)
         writer = ExcelWriter(bio, engine=engine)
         self.df.to_excel(writer, sheet_name="Sheet1")
+        writer.save()
+
+
+class WriteExcelStyled:
+    params = ["openpyxl", "xlsxwriter"]
+    param_names = ["engine"]
+
+    def setup(self, engine):
+        self.df = _generate_dataframe()
+
+    def time_write_excel_style(self, engine):
+        bio = BytesIO()
+        bio.seek(0)
+        writer = ExcelWriter(bio, engine=engine)
+        df_style = self.df.style
+        df_style.applymap(lambda x: "border: red 1px solid;")
+        df_style.applymap(lambda x: "color: blue")
+        df_style.applymap(lambda x: "border-color: green black", subset=["float1"])
+        df_style.to_excel(writer, sheet_name="Sheet1")
         writer.save()
 
 

@@ -70,6 +70,7 @@ from pandas._libs.tslibs.np_datetime cimport (
 
 from .dtypes cimport PeriodDtypeCode
 from .timedeltas cimport (
+    _Timedelta,
     delta_to_nanoseconds,
     is_any_td_scalar,
 )
@@ -795,6 +796,7 @@ cdef class SingleConstructorOffset(BaseOffset):
 cdef class Tick(SingleConstructorOffset):
     _adjust_dst = False
     _prefix = "undefined"
+    _td64_unit = "undefined"
     _attributes = tuple(["n", "normalize"])
 
     def __init__(self, n=1, normalize=False):
@@ -967,6 +969,7 @@ cdef class Tick(SingleConstructorOffset):
 cdef class Day(Tick):
     _nanos_inc = 24 * 3600 * 1_000_000_000
     _prefix = "D"
+    _td64_unit = "D"
     _period_dtype_code = PeriodDtypeCode.D
     _reso = NPY_DATETIMEUNIT.NPY_FR_D
 
@@ -974,6 +977,7 @@ cdef class Day(Tick):
 cdef class Hour(Tick):
     _nanos_inc = 3600 * 1_000_000_000
     _prefix = "H"
+    _td64_unit = "h"
     _period_dtype_code = PeriodDtypeCode.H
     _reso = NPY_DATETIMEUNIT.NPY_FR_h
 
@@ -981,6 +985,7 @@ cdef class Hour(Tick):
 cdef class Minute(Tick):
     _nanos_inc = 60 * 1_000_000_000
     _prefix = "T"
+    _td64_unit = "m"
     _period_dtype_code = PeriodDtypeCode.T
     _reso = NPY_DATETIMEUNIT.NPY_FR_m
 
@@ -988,6 +993,7 @@ cdef class Minute(Tick):
 cdef class Second(Tick):
     _nanos_inc = 1_000_000_000
     _prefix = "S"
+    _td64_unit = "s"
     _period_dtype_code = PeriodDtypeCode.S
     _reso = NPY_DATETIMEUNIT.NPY_FR_s
 
@@ -995,6 +1001,7 @@ cdef class Second(Tick):
 cdef class Milli(Tick):
     _nanos_inc = 1_000_000
     _prefix = "L"
+    _td64_unit = "ms"
     _period_dtype_code = PeriodDtypeCode.L
     _reso = NPY_DATETIMEUNIT.NPY_FR_ms
 
@@ -1002,6 +1009,7 @@ cdef class Milli(Tick):
 cdef class Micro(Tick):
     _nanos_inc = 1000
     _prefix = "U"
+    _td64_unit = "us"
     _period_dtype_code = PeriodDtypeCode.U
     _reso = NPY_DATETIMEUNIT.NPY_FR_us
 
@@ -1009,6 +1017,7 @@ cdef class Micro(Tick):
 cdef class Nano(Tick):
     _nanos_inc = 1
     _prefix = "N"
+    _td64_unit = "ns"
     _period_dtype_code = PeriodDtypeCode.N
     _reso = NPY_DATETIMEUNIT.NPY_FR_ns
 
@@ -1140,7 +1149,9 @@ cdef class RelativeDeltaOffset(BaseOffset):
 
             weeks = kwds.get("weeks", 0) * self.n
             if weeks:
-                dt64other = dt64other + Timedelta(days=7 * weeks)
+                delta = Timedelta(days=7 * weeks)
+                td = (<_Timedelta>delta)._as_reso(reso)
+                dt64other = dt64other + td
 
             timedelta_kwds = {
                 k: v
@@ -1149,13 +1160,14 @@ cdef class RelativeDeltaOffset(BaseOffset):
             }
             if timedelta_kwds:
                 delta = Timedelta(**timedelta_kwds)
-                dt64other = dt64other + (self.n * delta)
-                # FIXME: fails to preserve non-nano
+                td = (<_Timedelta>delta)._as_reso(reso)
+                dt64other = dt64other + (self.n * td)
             return dt64other
         elif not self._use_relativedelta and hasattr(self, "_offset"):
             # timedelta
-            # FIXME: fails to preserve non-nano
-            return dt64other + Timedelta(self._offset * self.n)
+            delta = Timedelta(self._offset * self.n)
+            td = (<_Timedelta>delta)._as_reso(reso)
+            return dt64other + td
         else:
             # relativedelta with other keywords
             kwd = set(kwds) - relativedelta_fast
@@ -1562,8 +1574,9 @@ cdef class BusinessHour(BusinessMixin):
 
     def _repr_attrs(self) -> str:
         out = super()._repr_attrs()
+        # Use python string formatting to be faster than strftime
         hours = ",".join(
-            f'{st.strftime("%H:%M")}-{en.strftime("%H:%M")}'
+            f'{st.hour:02d}:{st.minute:02d}-{en.hour:02d}:{en.minute:02d}'
             for st, en in zip(self.start, self.end)
         )
         attrs = [f"{self._prefix}={hours}"]
@@ -3111,7 +3124,7 @@ cdef class FY5253Quarter(FY5253Mixin):
             for qlen in qtr_lens:
                 if qlen * 7 <= tdelta.days:
                     num_qtrs += 1
-                    tdelta -= Timedelta(days=qlen * 7)
+                    tdelta -= (<_Timedelta>Timedelta(days=qlen * 7))._as_reso(norm._reso)
                 else:
                     break
         else:
