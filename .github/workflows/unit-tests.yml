@@ -151,9 +151,6 @@ jobs:
       with:
         environment-file: ${{ env.ENV_FILE }}
 
-    - name: Run sccache-cache
-      uses: mozilla-actions/sccache-action@v0.0.3
-
     - name: Build Pandas
       id: build
       uses: ./.github/actions/build_pandas
