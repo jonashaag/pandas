@@ -94,7 +94,7 @@ jobs:
       group: ${{ github.event_name == 'push' && github.run_number || github.ref }}-${{ matrix.env_file }}-${{ matrix.pattern }}-${{ matrix.extra_apt || '' }}
       cancel-in-progress: true
 
-    services:
+#     services:
 #       mysql:
 #         image: mysql
 #         env:
