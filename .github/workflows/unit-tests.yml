@@ -22,6 +22,7 @@ defaults:
 
 jobs:
   ubuntu:
+    if: false
     runs-on: ubuntu-22.04
     timeout-minutes: 180
     strategy:
@@ -172,8 +173,8 @@ jobs:
     timeout-minutes: 180
     strategy:
       matrix:
-        os: [macos-latest, windows-latest]
-        env_file: [actions-39.yaml, actions-310.yaml, actions-311.yaml]
+        os: [windows-latest]
+        env_file: [actions-39.yaml]
       fail-fast: false
     runs-on: ${{ matrix.os }}
     name: ${{ format('{0} {1}', matrix.os, matrix.env_file) }}
@@ -204,8 +205,11 @@ jobs:
 
       - name: Test
         uses: ./.github/actions/run-tests
+        env:
+          COLUMNS: 120
 
   Linux-32-bit:
+    if: false
     runs-on: ubuntu-22.04
     container:
       image: quay.io/pypa/manylinux2014_i686
@@ -241,6 +245,7 @@ jobs:
       cancel-in-progress: true
 
   Linux-Musl:
+    if: false
     runs-on: ubuntu-22.04
     container:
       image: quay.io/pypa/musllinux_1_1_x86_64

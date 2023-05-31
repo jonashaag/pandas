@@ -44,6 +44,7 @@ from pandas.core.dtypes.common import (
     is_bool,
     is_dict_like,
     is_integer_dtype,
+    is_list_like,
     is_numeric_dtype,
     is_scalar,
 )
@@ -51,6 +52,7 @@ from pandas.core.dtypes.dtypes import (
     CategoricalDtype,
     IntervalDtype,
 )
+from pandas.core.dtypes.inference import is_hashable
 from pandas.core.dtypes.missing import (
     isna,
     notna,
@@ -828,7 +830,7 @@ class SeriesGroupBy(GroupBy[Series]):
         value: object | ArrayLike | None = None,
         method: FillnaOptions | None = None,
         axis: Axis | None | lib.NoDefault = lib.no_default,
-        inplace: bool = False,
+        inplace: bool | lib.NoDefault = lib.no_default,
         limit: int | None = None,
         downcast: dict | None = None,
     ) -> Series | None:
@@ -858,6 +860,10 @@ class SeriesGroupBy(GroupBy[Series]):
 
         inplace : bool, default False
             Broken. Do not set to True.
+
+            .. deprecated:: 2.1.0
+                The inplace argument will be removed in a future version of pandas.
+
         limit : int, default None
             If method is specified, this is the maximum number of consecutive
             NaN values to forward/backward fill within a group. In other words,
@@ -923,6 +929,17 @@ class SeriesGroupBy(GroupBy[Series]):
         5    NaN
         dtype: float64
         """
+        if inplace is not lib.no_default:
+            warnings.warn(
+                message=(
+                    "Setting inplace=True is currently broken. The inplace argument "
+                    "is deprecated and will be removed in a future version of pandas."
+                ),
+                category=FutureWarning,
+                stacklevel=find_stack_level(),
+            )
+        else:
+            inplace = False
         result = self._op_via_apply(
             "fillna",
             value=value,
@@ -1170,13 +1187,41 @@ class SeriesGroupBy(GroupBy[Series]):
         return result
 
     @property
-    @doc(Series.is_monotonic_increasing.__doc__)
     def is_monotonic_increasing(self) -> Series:
+        """
+        Return whether each group's values are monotonically increasing.
+
+        Returns
+        -------
+        Series
+
+        Examples
+        --------
+        >>> s = pd.Series([2, 1, 3, 4], index=['Falcon', 'Falcon', 'Parrot', 'Parrot'])
+        >>> s.groupby(level=0).is_monotonic_increasing
+        Falcon    False
+        Parrot     True
+        dtype: bool
+        """
         return self.apply(lambda ser: ser.is_monotonic_increasing)
 
     @property
-    @doc(Series.is_monotonic_decreasing.__doc__)
     def is_monotonic_decreasing(self) -> Series:
+        """
+        Return whether each group's values are monotonically decreasing.
+
+        Returns
+        -------
+        Series
+
+        Examples
+        --------
+        >>> s = pd.Series([2, 1, 3, 4], index=['Falcon', 'Falcon', 'Parrot', 'Parrot'])
+        >>> s.groupby(level=0).is_monotonic_decreasing
+        Falcon     True
+        Parrot    False
+        dtype: bool
+        """
         return self.apply(lambda ser: ser.is_monotonic_decreasing)
 
     @doc(Series.hist.__doc__)
@@ -1217,8 +1262,46 @@ class SeriesGroupBy(GroupBy[Series]):
     def dtype(self) -> Series:
         return self.apply(lambda ser: ser.dtype)
 
-    @doc(Series.unique.__doc__)
     def unique(self) -> Series:
+        """
+        Return unique values for each group.
+
+        It returns unique values for each of the grouped values. Returned in
+        order of appearance. Hash table-based unique, therefore does NOT sort.
+
+        Returns
+        -------
+        Series
+            Unique values for each of the grouped values.
+
+        See Also
+        --------
+        Series.unique : Return unique values of Series object.
+
+        Examples
+        --------
+        >>> df = pd.DataFrame([('Chihuahua', 'dog', 6.1),
+        ...                    ('Beagle', 'dog', 15.2),
+        ...                    ('Chihuahua', 'dog', 6.9),
+        ...                    ('Persian', 'cat', 9.2),
+        ...                    ('Chihuahua', 'dog', 7),
+        ...                    ('Persian', 'cat', 8.8)],
+        ...                   columns=['breed', 'animal', 'height_in'])
+        >>> df
+               breed     animal   height_in
+        0  Chihuahua        dog         6.1
+        1     Beagle        dog        15.2
+        2  Chihuahua        dog         6.9
+        3    Persian        cat         9.2
+        4  Chihuahua        dog         7.0
+        5    Persian        cat         8.8
+        >>> ser = df.groupby('animal')['breed'].unique()
+        >>> ser
+        animal
+        cat              [Persian]
+        dog    [Chihuahua, Beagle]
+        Name: breed, dtype: object
+        """
         result = self._op_via_apply("unique")
         return result
 
@@ -1330,7 +1413,11 @@ class DataFrameGroupBy(GroupBy[DataFrame]):
         op = GroupByApply(self, func, args=args, kwargs=kwargs)
         result = op.agg()
         if not is_dict_like(func) and result is not None:
-            return result
+            # GH #52849
+            if not self.as_index and is_list_like(func):
+                return result.reset_index()
+            else:
+                return result
         elif relabeling:
             # this should be the only (non-raising) case with relabeling
             # used reordered index of columns
@@ -1474,9 +1561,16 @@ class DataFrameGroupBy(GroupBy[DataFrame]):
             #  fall through to the outer else clause
             # TODO: sure this is right?  we used to do this
             #  after raising AttributeError above
-            return self.obj._constructor_sliced(
-                values, index=key_index, name=self._selection
-            )
+            # GH 18930
+            if not is_hashable(self._selection):
+                # error: Need type annotation for "name"
+                name = tuple(self._selection)  # type: ignore[var-annotated, arg-type]
+            else:
+                # error: Incompatible types in assignment
+                # (expression has type "Hashable", variable
+                # has type "Tuple[Any, ...]")
+                name = self._selection  # type: ignore[assignment]
+            return self.obj._constructor_sliced(values, index=key_index, name=name)
         elif not isinstance(first_not_none, Series):
             # values are not series or array-like but scalars
             # self._selection not passed through to Series as the
@@ -2274,7 +2368,7 @@ class DataFrameGroupBy(GroupBy[DataFrame]):
         value: Hashable | Mapping | Series | DataFrame = None,
         method: FillnaOptions | None = None,
         axis: Axis | None | lib.NoDefault = lib.no_default,
-        inplace: bool = False,
+        inplace: bool | lib.NoDefault = lib.no_default,
         limit: int | None = None,
         downcast=None,
     ) -> DataFrame | None:
@@ -2308,6 +2402,10 @@ class DataFrameGroupBy(GroupBy[DataFrame]):
 
         inplace : bool, default False
             Broken. Do not set to True.
+
+            .. deprecated:: 2.1.0
+                The inplace argument will be removed in a future version of pandas.
+
         limit : int, default None
             If method is specified, this is the maximum number of consecutive
             NaN values to forward/backward fill within a group. In other words,
@@ -2394,6 +2492,17 @@ class DataFrameGroupBy(GroupBy[DataFrame]):
         3  3.0  NaN  2.0
         4  3.0  NaN  NaN
         """
+        if inplace is not lib.no_default:
+            warnings.warn(
+                message=(
+                    "Setting inplace=True is currently broken. The inplace argument "
+                    "is deprecated and will be removed in a future version of pandas."
+                ),
+                category=FutureWarning,
+                stacklevel=find_stack_level(),
+            )
+        else:
+            inplace = False
         result = self._op_via_apply(
             "fillna",
             value=value,
